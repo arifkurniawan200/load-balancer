@@ -88,3 +88,54 @@ func TestAliveConcurrencyAndReverseProxy(t *testing.T) {
 		t.Fatalf("expected X-Forwarded-Host lb.local, got %q", got)
 	}
 }
+
+func TestHealthStateTransitions(t *testing.T) {
+	b, err := New("http://localhost:9001", 1)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	// 2 kegagalan lalu 1 sukses: counter reset, backend tetap sehat
+	for i := 0; i < 2; i++ {
+		changed, alive := b.RecordHealthCheck(false, 3, 2)
+		if changed || !alive {
+			t.Fatalf("failure %d: expected (false, true), got (%v, %v)", i+1, changed, alive)
+		}
+	}
+	if changed, alive := b.RecordHealthCheck(true, 3, 2); changed || !alive {
+		t.Fatalf("reset check: expected (false, true), got (%v, %v)", changed, alive)
+	}
+
+	// 3 kegagalan berturut-turut: mati pada kegagalan ke-3
+	for i := 1; i <= 3; i++ {
+		changed, alive := b.RecordHealthCheck(false, 3, 2)
+		if i < 3 && (changed || !alive) {
+			t.Fatalf("failure %d: expected still alive, got (%v, %v)", i, changed, alive)
+		}
+		if i == 3 && (!changed || alive) {
+			t.Fatalf("failure 3: expected transition to dead (true, false), got (%v, %v)", changed, alive)
+		}
+	}
+
+	// 1 sukses lalu 1 gagal saat mati: belum pulih, counter sukses ter-reset
+	if changed, alive := b.RecordHealthCheck(true, 3, 2); changed || alive {
+		t.Fatalf("1st recovery success: expected (false, false), got (%v, %v)", changed, alive)
+	}
+	if changed, alive := b.RecordHealthCheck(false, 3, 2); changed || alive {
+		t.Fatalf("interrupted recovery: expected (false, false), got (%v, %v)", changed, alive)
+	}
+
+	// 1 sukses lalu MarkUnhealthy pasif: counter sukses harus ter-reset
+	_, _ = b.RecordHealthCheck(true, 3, 2)
+	if b.MarkUnhealthy() {
+		t.Fatalf("MarkUnhealthy on already-dead backend should return false")
+	}
+	if changed, alive := b.RecordHealthCheck(true, 3, 2); changed || alive {
+		t.Fatalf("after MarkUnhealthy reset, 1st success should not yet revive backend")
+	}
+
+	// Sukses ke-2 berturut-turut menghidupkan kembali backend
+	if changed, alive := b.RecordHealthCheck(true, 3, 2); !changed || !alive {
+		t.Fatalf("2nd consecutive success should revive backend, got (%v, %v)", changed, alive)
+	}
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/arifkurniawan200/load-balancer/internal/backend"
+	"github.com/arifkurniawan200/load-balancer/internal/health"
 	"github.com/arifkurniawan200/load-balancer/internal/proxy"
 	"github.com/arifkurniawan200/load-balancer/internal/strategy"
 )
@@ -22,6 +24,9 @@ func main() {
 
 	listenAddr := flag.String("listen", ":8080", "HTTP listen address for load balancer")
 	backendsCSV := flag.String("backends", "http://localhost:9001,http://localhost:9002,http://localhost:9003", "comma-separated list of backend URLs")
+	healthPath := flag.String("health-path", "/health", "HTTP path for active health checks")
+	healthInterval := flag.Duration("health-interval", 5*time.Second, "interval between active health checks")
+	healthTimeout := flag.Duration("health-timeout", 2*time.Second, "timeout per active health check request")
 	flag.Parse()
 
 	backends, err := parseBackends(*backendsCSV)
@@ -29,6 +34,21 @@ func main() {
 		logger.Error("failed to initialize backends", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+
+	hcCfg := health.DefaultConfig()
+	hcCfg.Path = *healthPath
+	hcCfg.Interval = *healthInterval
+	hcCfg.Timeout = *healthTimeout
+
+	checker, err := health.New(backends, hcCfg, logger)
+	if err != nil {
+		logger.Error("failed to initialize health checker", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go checker.Start(ctx)
 
 	strat := strategy.NewRoundRobin()
 	lb, err := proxy.New(backends, strat, logger)
