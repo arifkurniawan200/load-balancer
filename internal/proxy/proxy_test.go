@@ -79,15 +79,23 @@ func TestLoadBalancerRoundRobinIntegration(t *testing.T) {
 	}
 }
 
-func TestPassiveHealthCheckAndRetryWithBody(t *testing.T) {
-	// b1 dan b2 langsung ditutup (simulasi backend mati mendadak sebelum active check jalan)
-	deadSrv1 := httptest.NewServer(http.NotFoundHandler())
-	deadURL1 := deadSrv1.URL
-	deadSrv1.Close()
+func newDroppingServer(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close()
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
 
-	deadSrv2 := httptest.NewServer(http.NotFoundHandler())
-	deadURL2 := deadSrv2.URL
-	deadSrv2.Close()
+func TestPassiveHealthCheckAndRetryWithBody(t *testing.T) {
+	deadURL1 := newDroppingServer(t)
+	deadURL2 := newDroppingServer(t)
 
 	aliveSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		payload, _ := io.ReadAll(r.Body)
@@ -134,16 +142,13 @@ func TestPassiveRetryRespectsMaxTwoRetries(t *testing.T) {
 	// 3 backend mati berturut-turut + 1 backend hidup di urutan ke-4
 	var backends []*backend.Backend
 	for i := 0; i < 3; i++ {
-		s := httptest.NewServer(http.NotFoundHandler())
-		u := s.URL
-		s.Close()
-		b, _ := backend.New(u, 1)
+		b, _ := backend.New(newDroppingServer(t), 1)
 		backends = append(backends, b)
 	}
 
-	aliveHits := 0
+	var aliveHits atomic.Int64
 	aliveSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		aliveHits++
+		aliveHits.Add(1)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("b4-ok"))
 	}))
@@ -167,8 +172,8 @@ func TestPassiveRetryRespectsMaxTwoRetries(t *testing.T) {
 	if resp1.StatusCode != http.StatusBadGateway {
 		t.Fatalf("expected 502 Bad Gateway after max 2 retries, got %d", resp1.StatusCode)
 	}
-	if aliveHits != 0 {
-		t.Fatalf("expected b4 not to be hit on 1st request (max 2 retries), got %d", aliveHits)
+	if aliveHits.Load() != 0 {
+		t.Fatalf("expected b4 not to be hit on 1st request (max 2 retries), got %d", aliveHits.Load())
 	}
 
 	// Request ke-2: karena b1..b3 sudah ditandai mati secara pasif, request langsung sukses ke b4
@@ -177,8 +182,8 @@ func TestPassiveRetryRespectsMaxTwoRetries(t *testing.T) {
 		t.Fatalf("GET 2 failed: %v", err)
 	}
 	resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK || aliveHits != 1 {
-		t.Fatalf("expected 200 OK from b4 on 2nd request, got status=%d hits=%d", resp2.StatusCode, aliveHits)
+	if resp2.StatusCode != http.StatusOK || aliveHits.Load() != 1 {
+		t.Fatalf("expected 200 OK from b4 on 2nd request, got status=%d hits=%d", resp2.StatusCode, aliveHits.Load())
 	}
 }
 

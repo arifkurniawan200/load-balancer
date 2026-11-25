@@ -1,0 +1,9 @@
+.git
+.gitignore
+bin/
+lb
+backend
+*.test
+*.out
+coverage.txt
+README.md
