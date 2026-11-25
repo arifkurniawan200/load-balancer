@@ -6,13 +6,16 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
-	"strconv"
-	"strings"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/arifkurniawan200/load-balancer/internal/backend"
+	"github.com/arifkurniawan200/load-balancer/internal/config"
 	"github.com/arifkurniawan200/load-balancer/internal/health"
 	"github.com/arifkurniawan200/load-balancer/internal/proxy"
 	"github.com/arifkurniawan200/load-balancer/internal/strategy"
@@ -23,96 +26,144 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	listenAddr := flag.String("listen", ":8080", "HTTP listen address for load balancer")
-	strategyName := flag.String("strategy", strategy.NameRoundRobin, "load balancing strategy: round_robin | least_conn | consistent_hash | weighted_round_robin")
-	backendsCSV := flag.String("backends", "http://localhost:9001,http://localhost:9002,http://localhost:9003", "comma-separated backend URLs (optional @weight suffix, e.g. http://localhost:9001@3)")
-	healthPath := flag.String("health-path", "/health", "HTTP path for active health checks")
-	healthInterval := flag.Duration("health-interval", 5*time.Second, "interval between active health checks")
-	healthTimeout := flag.Duration("health-timeout", 2*time.Second, "timeout per active health check request")
-	flag.Parse()
-
-	backends, err := parseBackends(*backendsCSV)
+	cfg, err := parseFlagsAndConfig(os.Args[1:])
 	if err != nil {
-		logger.Error("failed to initialize backends", slog.String("error", err.Error()))
+		logger.Error("failed to load configuration", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
-	strat, err := strategy.New(*strategyName)
-	if err != nil {
-		logger.Error("invalid strategy", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	hcCfg := health.DefaultConfig()
-	hcCfg.Path = *healthPath
-	hcCfg.Interval = *healthInterval
-	hcCfg.Timeout = *healthTimeout
-
-	checker, err := health.New(backends, hcCfg, logger)
-	if err != nil {
-		logger.Error("failed to initialize health checker", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go checker.Start(ctx)
-
-	lb, err := proxy.New(backends, strat, logger)
-	if err != nil {
-		logger.Error("failed to create load balancer", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-
-	srv := &http.Server{
-		Addr:              *listenAddr,
-		Handler:           lb,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	logger.Info("starting HTTP load balancer",
-		slog.String("listen", *listenAddr),
-		slog.String("strategy", *strategyName),
-		slog.Int("backends", len(backends)),
-	)
-
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Error("load balancer stopped with error", slog.String("error", err.Error()))
+	if err := run(ctx, cfg, logger, nil); err != nil {
+		logger.Error("load balancer exited with error", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 }
 
-func parseBackends(rawCSV string) ([]*backend.Backend, error) {
-	parts := strings.Split(rawCSV, ",")
-	backends := make([]*backend.Backend, 0, len(parts))
+func parseFlagsAndConfig(args []string) (*config.Config, error) {
+	fs := flag.NewFlagSet("lb", flag.ContinueOnError)
+	configPath := fs.String("config", "config.yaml", "path to YAML configuration file")
+	listenOverride := fs.String("listen", "", "optional override for listen address")
+	strategyOverride := fs.String("strategy", "", "optional override for load balancing strategy")
 
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed == "" {
-			continue
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	overridden := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "listen":
+			cfg.Listen = *listenOverride
+			overridden = true
+		case "strategy":
+			cfg.Strategy = *strategyOverride
+			overridden = true
 		}
+	})
 
-		rawURL := trimmed
-		weight := 1
-		if idx := strings.LastIndex(trimmed, "@"); idx > 0 && idx < len(trimmed)-1 {
-			parsedWeight, err := strconv.Atoi(trimmed[idx+1:])
-			if err != nil || parsedWeight <= 0 {
-				return nil, fmt.Errorf("invalid weight in backend %q", trimmed)
-			}
-			rawURL = trimmed[:idx]
-			weight = parsedWeight
+	if overridden {
+		if err := cfg.Validate(); err != nil {
+			return nil, err
 		}
+	}
 
-		b, err := backend.New(rawURL, weight)
+	return cfg, nil
+}
+
+func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, readyCh chan<- string) error {
+	backends := make([]*backend.Backend, 0, len(cfg.Backends))
+	for _, bCfg := range cfg.Backends {
+		b, err := backend.New(bCfg.URL, bCfg.Weight)
 		if err != nil {
-			return nil, fmt.Errorf("invalid backend %q: %w", trimmed, err)
+			return fmt.Errorf("init backend %q: %w", bCfg.URL, err)
 		}
 		backends = append(backends, b)
 	}
 
-	if len(backends) == 0 {
-		return nil, errors.New("at least one backend URL is required")
+	strat, err := strategy.New(cfg.Strategy)
+	if err != nil {
+		return err
 	}
 
-	return backends, nil
+	checker, err := health.New(backends, health.Config{
+		Path:          cfg.HealthCheck.Path,
+		Interval:      cfg.HealthCheck.Interval,
+		Timeout:       cfg.HealthCheck.Timeout,
+		FailThreshold: cfg.HealthCheck.FailThreshold,
+		RiseThreshold: cfg.HealthCheck.RiseThreshold,
+	}, logger)
+	if err != nil {
+		return fmt.Errorf("init health checker: %w", err)
+	}
+
+	lb, err := proxy.New(backends, strat, logger)
+	if err != nil {
+		return fmt.Errorf("init proxy: %w", err)
+	}
+
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.Listen, err)
+	}
+
+	srv := &http.Server{
+		Handler:           lb,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	checkerCtx, cancelChecker := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		checker.Start(checkerCtx)
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		logger.Info("starting HTTP load balancer",
+			slog.String("listen", ln.Addr().String()),
+			slog.String("strategy", cfg.Strategy),
+			slog.Int("backends", len(backends)),
+		)
+		if readyCh != nil {
+			readyCh <- ln.Addr().String()
+		}
+		if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- serveErr
+		}
+		close(errCh)
+	}()
+
+	select {
+	case serveErr := <-errCh:
+		cancelChecker()
+		wg.Wait()
+		return serveErr
+
+	case <-ctx.Done():
+		logger.Info("shutdown signal received; draining in-flight requests",
+			slog.Duration("timeout", cfg.ShutdownTimeout),
+		)
+		cancelChecker()
+
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancelShutdown()
+
+		shutdownErr := srv.Shutdown(shutdownCtx)
+		wg.Wait()
+
+		if shutdownErr != nil {
+			return fmt.Errorf("graceful shutdown failed: %w", shutdownErr)
+		}
+		logger.Info("load balancer shut down gracefully")
+		return nil
+	}
 }
