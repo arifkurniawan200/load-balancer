@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +24,8 @@ func main() {
 	}))
 
 	listenAddr := flag.String("listen", ":8080", "HTTP listen address for load balancer")
-	backendsCSV := flag.String("backends", "http://localhost:9001,http://localhost:9002,http://localhost:9003", "comma-separated list of backend URLs")
+	strategyName := flag.String("strategy", strategy.NameRoundRobin, "load balancing strategy: round_robin | least_conn | consistent_hash | weighted_round_robin")
+	backendsCSV := flag.String("backends", "http://localhost:9001,http://localhost:9002,http://localhost:9003", "comma-separated backend URLs (optional @weight suffix, e.g. http://localhost:9001@3)")
 	healthPath := flag.String("health-path", "/health", "HTTP path for active health checks")
 	healthInterval := flag.Duration("health-interval", 5*time.Second, "interval between active health checks")
 	healthTimeout := flag.Duration("health-timeout", 2*time.Second, "timeout per active health check request")
@@ -32,6 +34,12 @@ func main() {
 	backends, err := parseBackends(*backendsCSV)
 	if err != nil {
 		logger.Error("failed to initialize backends", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	strat, err := strategy.New(*strategyName)
+	if err != nil {
+		logger.Error("invalid strategy", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
@@ -50,7 +58,6 @@ func main() {
 	defer cancel()
 	go checker.Start(ctx)
 
-	strat := strategy.NewRoundRobin()
 	lb, err := proxy.New(backends, strat, logger)
 	if err != nil {
 		logger.Error("failed to create load balancer", slog.String("error", err.Error()))
@@ -65,7 +72,7 @@ func main() {
 
 	logger.Info("starting HTTP load balancer",
 		slog.String("listen", *listenAddr),
-		slog.String("strategy", "round_robin"),
+		slog.String("strategy", *strategyName),
 		slog.Int("backends", len(backends)),
 	)
 
@@ -84,7 +91,19 @@ func parseBackends(rawCSV string) ([]*backend.Backend, error) {
 		if trimmed == "" {
 			continue
 		}
-		b, err := backend.New(trimmed, 1)
+
+		rawURL := trimmed
+		weight := 1
+		if idx := strings.LastIndex(trimmed, "@"); idx > 0 && idx < len(trimmed)-1 {
+			parsedWeight, err := strconv.Atoi(trimmed[idx+1:])
+			if err != nil || parsedWeight <= 0 {
+				return nil, fmt.Errorf("invalid weight in backend %q", trimmed)
+			}
+			rawURL = trimmed[:idx]
+			weight = parsedWeight
+		}
+
+		b, err := backend.New(rawURL, weight)
 		if err != nil {
 			return nil, fmt.Errorf("invalid backend %q: %w", trimmed, err)
 		}

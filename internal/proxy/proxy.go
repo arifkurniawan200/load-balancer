@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"sync"
 	"time"
 
 	"github.com/arifkurniawan200/load-balancer/internal/backend"
@@ -24,13 +25,14 @@ const (
 type retryContextKey struct{}
 
 type requestAttemptState struct {
-	origReq      *http.Request
-	origCtx      context.Context
-	recorder     *statusRecorder
-	bodyBytes    []byte
-	canRetryBody bool
-	retries      int
-	finalBackend string
+	origReq            *http.Request
+	origCtx            context.Context
+	recorder           *statusRecorder
+	bodyBytes          []byte
+	canRetryBody       bool
+	retries            int
+	finalBackend       string
+	releaseCurrentConn func()
 }
 
 // LoadBalancer menerima trafik HTTP masuk dan meneruskannya ke backend sehat sesuai Strategy.
@@ -145,6 +147,16 @@ func (lb *LoadBalancer) dispatchAttempt(state *requestAttemptState) {
 	}
 
 	state.finalBackend = target.URLString()
+	target.IncConnections()
+	var decOnce sync.Once
+	release := func() {
+		decOnce.Do(func() {
+			target.DecConnections()
+		})
+	}
+	state.releaseCurrentConn = release
+	defer release()
+
 	if rp, ok := lb.proxies[target]; ok {
 		rp.ServeHTTP(state.recorder, attemptReq)
 		return
@@ -155,6 +167,9 @@ func (lb *LoadBalancer) dispatchAttempt(state *requestAttemptState) {
 func (lb *LoadBalancer) makeErrorHandler(b *backend.Backend) func(http.ResponseWriter, *http.Request, error) {
 	return func(rw http.ResponseWriter, req *http.Request, err error) {
 		state, _ := req.Context().Value(retryContextKey{}).(*requestAttemptState)
+		if state != nil && state.releaseCurrentConn != nil {
+			state.releaseCurrentConn()
+		}
 
 		// Jika client sendiri membatalkan request, jangan tandai backend bermasalah.
 		if state != nil && state.origCtx.Err() != nil {

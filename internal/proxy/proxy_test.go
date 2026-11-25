@@ -5,7 +5,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/arifkurniawan200/load-balancer/internal/backend"
 	"github.com/arifkurniawan200/load-balancer/internal/strategy"
@@ -176,5 +179,73 @@ func TestPassiveRetryRespectsMaxTwoRetries(t *testing.T) {
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK || aliveHits != 1 {
 		t.Fatalf("expected 200 OK from b4 on 2nd request, got status=%d hits=%d", resp2.StatusCode, aliveHits)
+	}
+}
+
+func TestLeastConnectionsWithSlowBackendIntegration(t *testing.T) {
+	var slowHits, fast1Hits, fast2Hits atomic.Int64
+
+	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		slowHits.Add(1)
+		time.Sleep(80 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slowSrv.Close()
+
+	fastSrv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fast1Hits.Add(1)
+		time.Sleep(3 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fastSrv1.Close()
+
+	fastSrv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fast2Hits.Add(1)
+		time.Sleep(3 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fastSrv2.Close()
+
+	bSlow, _ := backend.New(slowSrv.URL, 1)
+	bFast1, _ := backend.New(fastSrv1.URL, 1)
+	bFast2, _ := backend.New(fastSrv2.URL, 1)
+	backends := []*backend.Backend{bSlow, bFast1, bFast2}
+
+	lb, err := New(backends, strategy.NewLeastConnections(), nil)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	lbServer := httptest.NewServer(lb)
+	defer lbServer.Close()
+
+	// Kirim 8 worker konkuren x 5 request = 40 request
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 5; i++ {
+				resp, err := http.Get(lbServer.URL + "/work")
+				if err != nil {
+					t.Errorf("GET failed: %v", err)
+					return
+				}
+				resp.Body.Close()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Backend cepat harus melayani jauh lebih banyak request daripada backend lambat
+	fastTotal := fast1Hits.Load() + fast2Hits.Load()
+	if fastTotal <= slowHits.Load()*2 {
+		t.Fatalf("expected fast backends (%d) to handle >2x slow backend (%d)", fastTotal, slowHits.Load())
+	}
+
+	// Seluruh counter koneksi aktif wajib kembali tepat ke 0 setelah seluruh request selesai
+	for _, b := range backends {
+		if got := b.ActiveConnections(); got != 0 {
+			t.Fatalf("expected 0 active connections on %s after completion, got %d", b.URLString(), got)
+		}
 	}
 }

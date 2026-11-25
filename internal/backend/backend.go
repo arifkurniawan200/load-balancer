@@ -22,6 +22,7 @@ type Backend struct {
 	url          *url.URL
 	weight       int
 	alive        atomic.Bool
+	activeConns  atomic.Int64
 	reverseProxy *httputil.ReverseProxy
 
 	stateMu              sync.Mutex
@@ -166,6 +167,29 @@ func (b *Backend) RecordHealthCheck(healthy bool, failThreshold, riseThreshold i
 		return true, false
 	}
 	return false, true
+}
+
+// ActiveConnections mengembalikan jumlah koneksi/request in-flight ke backend saat ini.
+func (b *Backend) ActiveConnections() int64 {
+	return b.activeConns.Load()
+}
+
+// IncConnections menambah counter koneksi aktif sebesar 1 secara atomic.
+func (b *Backend) IncConnections() int64 {
+	return b.activeConns.Add(1)
+}
+
+// DecConnections mengurangi counter koneksi aktif sebesar 1 secara atomic (dijaga tidak negatif).
+func (b *Backend) DecConnections() int64 {
+	for {
+		cur := b.activeConns.Load()
+		if cur <= 0 {
+			return 0
+		}
+		if b.activeConns.CompareAndSwap(cur, cur-1) {
+			return cur - 1
+		}
+	}
 }
 
 // ServeHTTP meneruskan HTTP request ke upstream melalui httputil.ReverseProxy default.
