@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"log/slog"
@@ -8,13 +9,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/arifkurniawan200/load-balancer/internal/config"
 )
 
-func TestGracefulShutdownCompletesInFlightRequest(t *testing.T) {
+func TestGracefulShutdownCompletesInFlightRequestAndClosesSSE(t *testing.T) {
 	inFlightEntered := make(chan struct{})
 	allowFinish := make(chan struct{})
 
@@ -51,13 +53,27 @@ func TestGracefulShutdownCompletesInFlightRequest(t *testing.T) {
 	ctx, triggerShutdown := context.WithCancel(context.Background())
 	defer triggerShutdown()
 
-	readyCh := make(chan string, 1)
+	readyCh := make(chan boundAddresses, 1)
 	runErrCh := make(chan error, 1)
 	go func() {
 		runErrCh <- run(ctx, cfg, logger, readyCh)
 	}()
 
-	listenAddr := <-readyCh
+	addrs := <-readyCh
+
+	// Buka koneksi SSE aktif di dashboard untuk memastikan koneksi SSE tidak menahan Shutdown.
+	sseResp, err := http.Get("http://" + addrs.dashboardAddr + "/events")
+	if err != nil {
+		t.Fatalf("GET dashboard /events failed: %v", err)
+	}
+	defer sseResp.Body.Close()
+
+	sseScan := bufio.NewScanner(sseResp.Body)
+	for sseScan.Scan() {
+		if strings.HasPrefix(sseScan.Text(), "data: ") {
+			break
+		}
+	}
 
 	type clientResult struct {
 		status int
@@ -66,7 +82,7 @@ func TestGracefulShutdownCompletesInFlightRequest(t *testing.T) {
 	}
 	resCh := make(chan clientResult, 1)
 	go func() {
-		resp, err := http.Get("http://" + listenAddr + "/slow-job")
+		resp, err := http.Get("http://" + addrs.proxyAddr + "/slow-job")
 		if err != nil {
 			resCh <- clientResult{err: err}
 			return
@@ -79,10 +95,9 @@ func TestGracefulShutdownCompletesInFlightRequest(t *testing.T) {
 	// Tunggu hingga request benar-benar sedang diproses di backend
 	<-inFlightEntered
 
-	// Picu graceful shutdown (setara SIGINT/SIGTERM) saat request masih berjalan
+	// Picu graceful shutdown saat request proxy in-flight DAN koneksi SSE dashboard terbuka
 	triggerShutdown()
 
-	// Beri jeda singkat untuk memastikan server menunggu request selesai, bukan memutus paksa
 	time.Sleep(40 * time.Millisecond)
 	close(allowFinish)
 
@@ -95,7 +110,7 @@ func TestGracefulShutdownCompletesInFlightRequest(t *testing.T) {
 	}
 
 	if err := <-runErrCh; err != nil {
-		t.Fatalf("expected clean graceful shutdown, got error: %v", err)
+		t.Fatalf("expected clean graceful shutdown of proxy and dashboard, got error: %v", err)
 	}
 }
 
@@ -114,11 +129,11 @@ backends:
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	cfg, err := parseFlagsAndConfig([]string{"-config", cfgPath, "-listen", ":19080", "-strategy", "least_conn"})
+	cfg, err := parseFlagsAndConfig([]string{"-config", cfgPath, "-listen", ":19080", "-dashboard", ":19081", "-strategy", "least_conn"})
 	if err != nil {
 		t.Fatalf("parseFlagsAndConfig failed: %v", err)
 	}
-	if cfg.Listen != ":19080" || cfg.Strategy != "least_conn" {
-		t.Fatalf("expected overrides applied, got listen=%q strategy=%q", cfg.Listen, cfg.Strategy)
+	if cfg.Listen != ":19080" || cfg.Dashboard != ":19081" || cfg.Strategy != "least_conn" {
+		t.Fatalf("expected overrides applied, got listen=%q dashboard=%q strategy=%q", cfg.Listen, cfg.Dashboard, cfg.Strategy)
 	}
 }

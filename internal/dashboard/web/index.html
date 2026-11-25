@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Go HTTP Load Balancer — Real-Time Telemetry</title>
+  <meta name="description" content="Real-time operational telemetry dashboard for Go HTTP Load Balancer showing backend health, active connections, throughput, errors, and latency via Server-Sent Events.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg-page: hsl(210, 20%, 97%);
+      --bg-surface: hsl(0, 0%, 100%);
+      --bg-subtle: hsl(210, 18%, 95%);
+      --border-subtle: hsl(214, 18%, 89%);
+      --border-strong: hsl(214, 16%, 80%);
+      --text-primary: hsl(215, 28%, 13%);
+      --text-secondary: hsl(215, 15%, 40%);
+      --text-muted: hsl(215, 13%, 54%);
+      --accent-blue: hsl(201, 90%, 38%);
+      --accent-teal: hsl(173, 80%, 34%);
+      --status-ok-bg: hsl(152, 60%, 94%);
+      --status-ok-fg: hsl(154, 72%, 24%);
+      --status-ok-dot: hsl(152, 69%, 36%);
+      --status-down-bg: hsl(355, 80%, 95%);
+      --status-down-fg: hsl(355, 72%, 35%);
+      --status-down-dot: hsl(355, 75%, 48%);
+      --status-warn-bg: hsl(38, 92%, 94%);
+      --status-warn-fg: hsl(32, 85%, 30%);
+      --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 12px rgba(15, 23, 42, 0.03);
+      --radius-md: 10px;
+      --radius-sm: 6px;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background-color: var(--bg-page);
+      color: var(--text-primary);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      padding-bottom: 3rem;
+    }
+
+    .container {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 0 1.5rem;
+    }
+
+    /* Top Header */
+    .topbar {
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 1.1rem 0;
+      margin-bottom: 1.75rem;
+    }
+
+    .topbar-inner {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .brand-group h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+    }
+
+    .brand-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.75rem;
+      margin-top: 0.25rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+    }
+
+    .tag-chip {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 500;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-subtle);
+      padding: 0.15rem 0.5rem;
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .sse-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-size: 0.78rem;
+      font-weight: 500;
+      padding: 0.35rem 0.7rem;
+      border-radius: var(--radius-sm);
+      background: var(--status-ok-bg);
+      color: var(--status-ok-fg);
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+
+    .sse-badge.reconnecting {
+      background: var(--status-warn-bg);
+      color: var(--status-warn-fg);
+    }
+
+    .sse-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .nav-link {
+      font-size: 0.8125rem;
+      font-weight: 500;
+      color: var(--text-secondary);
+      text-decoration: none;
+      padding: 0.35rem 0.65rem;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      background: var(--bg-surface);
+      transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+    }
+
+    .nav-link:hover {
+      border-color: var(--border-strong);
+      color: var(--text-primary);
+      background: var(--bg-subtle);
+    }
+
+    /* Summary KPI Row */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .kpi-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1.1rem 1.25rem;
+      box-shadow: var(--shadow-card);
+    }
+
+    .kpi-label {
+      font-size: 0.78rem;
+      font-weight: 500;
+      color: var(--text-secondary);
+      margin-bottom: 0.4rem;
+    }
+
+    .kpi-value {
+      font-family: var(--font-mono);
+      font-size: 1.55rem;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-primary);
+    }
+
+    .kpi-sub {
+      margin-top: 0.3rem;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Charts Grid */
+    .charts-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1.25rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow-card);
+      overflow: hidden;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .panel-title {
+      font-size: 0.925rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      color: var(--text-primary);
+    }
+
+    .panel-subtitle {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    .chart-box {
+      position: relative;
+      height: 250px;
+      padding: 1rem 1.25rem;
+    }
+
+    .chart-fallback {
+      display: none;
+      height: 100%;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+
+    /* Backends Table */
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+
+    th {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      background: var(--bg-subtle);
+      padding: 0.75rem 1.25rem;
+      border-bottom: 1px solid var(--border-subtle);
+      white-space: nowrap;
+    }
+
+    td {
+      padding: 0.85rem 1.25rem;
+      border-bottom: 1px solid var(--border-subtle);
+      font-size: 0.85rem;
+      font-variant-numeric: tabular-nums;
+      vertical-align: middle;
+    }
+
+    tbody tr:last-child td {
+      border-bottom: none;
+    }
+
+    tbody tr {
+      transition: background-color 0.12s ease;
+    }
+
+    tbody tr:hover {
+      background-color: hsl(210, 25%, 98.5%);
+    }
+
+    .mono {
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+    }
+
+    .num {
+      text-align: right;
+      font-family: var(--font-mono);
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.22rem 0.6rem;
+      border-radius: 999px;
+    }
+
+    .status-pill.healthy {
+      background: var(--status-ok-bg);
+      color: var(--status-ok-fg);
+    }
+
+    .status-pill.unhealthy {
+      background: var(--status-down-bg);
+      color: var(--status-down-fg);
+    }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+
+    .status-pill.healthy .status-dot {
+      background: var(--status-ok-dot);
+    }
+
+    .status-pill.unhealthy .status-dot {
+      background: var(--status-down-dot);
+    }
+
+    .rps-cell {
+      min-width: 140px;
+    }
+
+    .rps-bar-track {
+      height: 5px;
+      width: 100%;
+      background: var(--bg-subtle);
+      border-radius: 999px;
+      margin-top: 0.3rem;
+      overflow: hidden;
+    }
+
+    .rps-bar-fill {
+      height: 100%;
+      background: var(--accent-blue);
+      border-radius: 999px;
+      transition: width 0.35s ease;
+    }
+
+    .error-nonzero {
+      color: var(--status-down-fg);
+      font-weight: 600;
+    }
+
+    @media (max-width: 1024px) {
+      .kpi-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+      .charts-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .kpi-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .container {
+        padding: 0 1rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand-group">
+        <h1>HTTP Load Balancer Telemetry</h1>
+        <div class="brand-meta">
+          <span>Strategy: <strong id="meta-strategy" class="tag-chip">—</strong></span>
+          <span>Uptime: <span id="meta-uptime" class="mono">0s</span></span>
+          <span>Updated: <span id="meta-updated" class="mono">—</span></span>
+        </div>
+      </div>
+      <nav class="header-actions" aria-label="Telemetry endpoints">
+        <div id="sse-indicator" class="sse-badge" role="status" aria-live="polite">
+          <span class="sse-dot"></span>
+          <span id="sse-text">Connecting...</span>
+        </div>
+        <a id="link-metrics" class="nav-link" href="/metrics" target="_blank" rel="noopener">/metrics</a>
+        <a id="link-stats-json" class="nav-link" href="/api/stats" target="_blank" rel="noopener">JSON</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="kpi-grid" aria-label="Cluster summary metrics">
+      <article class="kpi-card">
+        <div class="kpi-label">Healthy Backends</div>
+        <div id="kpi-healthy" class="kpi-value">0 / 0</div>
+        <div class="kpi-sub">Upstream pool availability</div>
+      </article>
+      <article class="kpi-card">
+        <div class="kpi-label">Active Connections</div>
+        <div id="kpi-active-conns" class="kpi-value">0</div>
+        <div class="kpi-sub">In-flight HTTP requests</div>
+      </article>
+      <article class="kpi-card">
+        <div class="kpi-label">Throughput (RPS)</div>
+        <div id="kpi-rps" class="kpi-value">0.0</div>
+        <div class="kpi-sub">Requests / sec (1s window)</div>
+      </article>
+      <article class="kpi-card">
+        <div class="kpi-label">Total Requests</div>
+        <div id="kpi-total-req" class="kpi-value">0</div>
+        <div id="kpi-error-summary" class="kpi-sub">0 errors (0.00%)</div>
+      </article>
+      <article class="kpi-card">
+        <div class="kpi-label">Avg Latency</div>
+        <div id="kpi-avg-latency" class="kpi-value">0.00 ms</div>
+        <div id="kpi-recent-latency" class="kpi-sub">1s window: 0.00 ms</div>
+      </article>
+    </section>
+
+    <section class="charts-grid" aria-label="Real-time performance charts">
+      <article class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">Requests per Second by Backend</h2>
+          <span class="panel-subtitle">60s rolling SSE stream</span>
+        </div>
+        <div class="chart-box">
+          <canvas id="rps-chart"></canvas>
+          <div id="rps-chart-fallback" class="chart-fallback">Chart.js unavailable offline — table updates remain active.</div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">Backend Latency (ms)</h2>
+          <span class="panel-subtitle">1s window avg latency</span>
+        </div>
+        <div class="chart-box">
+          <canvas id="latency-chart"></canvas>
+          <div id="latency-chart-fallback" class="chart-fallback">Chart.js unavailable offline — table updates remain active.</div>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel" aria-label="Backend pool status">
+      <div class="panel-header">
+        <h2 class="panel-title">Upstream Backends</h2>
+        <span class="panel-subtitle">Live health, connections, throughput, errors, and latency</span>
+      </div>
+      <div class="table-wrap">
+        <table id="backends-table">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Backend URL</th>
+              <th class="num">Weight</th>
+              <th class="num">Active Conns</th>
+              <th class="rps-cell">Req / sec</th>
+              <th class="num">Total Requests</th>
+              <th class="num">Errors</th>
+              <th class="num">Avg Latency</th>
+              <th class="num">1s Latency</th>
+            </tr>
+          </thead>
+          <tbody id="backends-tbody">
+            <tr>
+              <td colspan="9" style="text-align:center;color:var(--text-muted);padding:2rem;">Waiting for telemetry stream...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (function () {
+      const MAX_POINTS = 60;
+      const SERIES_PALETTE = [
+        '#0284c7', // Ocean Blue
+        '#0d9488', // Teal
+        '#d97706', // Amber
+        '#e11d48', // Crimson Rose
+        '#16a34a', // Emerald
+        '#475569'  // Slate
+      ];
+
+      const els = {
+        strategy: document.getElementById('meta-strategy'),
+        uptime: document.getElementById('meta-uptime'),
+        updated: document.getElementById('meta-updated'),
+        sseBadge: document.getElementById('sse-indicator'),
+        sseText: document.getElementById('sse-text'),
+        kpiHealthy: document.getElementById('kpi-healthy'),
+        kpiActive: document.getElementById('kpi-active-conns'),
+        kpiRPS: document.getElementById('kpi-rps'),
+        kpiTotalReq: document.getElementById('kpi-total-req'),
+        kpiErrSummary: document.getElementById('kpi-error-summary'),
+        kpiAvgLatency: document.getElementById('kpi-avg-latency'),
+        kpiRecentLatency: document.getElementById('kpi-recent-latency'),
+        tbody: document.getElementById('backends-tbody')
+      };
+
+      let rpsChart = null;
+      let latencyChart = null;
+      const timeLabels = [];
+      const rpsSeriesByURL = new Map();
+      const latencySeriesByURL = new Map();
+
+      function initCharts() {
+        if (typeof window.Chart === 'undefined') {
+          document.getElementById('rps-chart').style.display = 'none';
+          document.getElementById('latency-chart').style.display = 'none';
+          document.getElementById('rps-chart-fallback').style.display = 'flex';
+          document.getElementById('latency-chart-fallback').style.display = 'flex';
+          return;
+        }
+
+        const baseOptions = (yUnit) => ({
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: { duration: 220 },
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: {
+              position: 'bottom',
+              labels: {
+                boxWidth: 10,
+                boxHeight: 10,
+                usePointStyle: true,
+                font: { family: "'Inter', sans-serif", size: 11 },
+                color: '#475569'
+              }
+            },
+            tooltip: {
+              backgroundColor: '#0f172a',
+              titleFont: { family: "'JetBrains Mono', monospace", size: 11 },
+              bodyFont: { family: "'JetBrains Mono', monospace", size: 11 }
+            }
+          },
+          scales: {
+            x: {
+              grid: { display: false },
+              ticks: { maxTicksLimit: 8, font: { family: "'JetBrains Mono', monospace", size: 10 }, color: '#64748b' }
+            },
+            y: {
+              beginAtZero: true,
+              grid: { color: 'rgba(148, 163, 184, 0.18)' },
+              ticks: {
+                font: { family: "'JetBrains Mono', monospace", size: 10 },
+                color: '#64748b',
+                callback: (v) => v + yUnit
+              }
+            }
+          }
+        });
+
+        rpsChart = new Chart(document.getElementById('rps-chart'), {
+          type: 'line',
+          data: { labels: timeLabels, datasets: [] },
+          options: baseOptions('')
+        });
+
+        latencyChart = new Chart(document.getElementById('latency-chart'), {
+          type: 'line',
+          data: { labels: timeLabels, datasets: [] },
+          options: baseOptions(' ms')
+        });
+      }
+
+      function shortBackendLabel(url) {
+        try {
+          const u = new URL(url);
+          return u.host;
+        } catch (_) {
+          return url;
+        }
+      }
+
+      function formatDurationSec(sec) {
+        const s = Math.max(0, Math.floor(sec));
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const rem = s % 60;
+        if (h > 0) return `${h}h ${m}m ${rem}s`;
+        if (m > 0) return `${m}m ${rem}s`;
+        return `${rem}s`;
+      }
+
+      function escapeHTML(str) {
+        return String(str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function updateCharts(snapshot) {
+        if (!rpsChart || !latencyChart) return;
+
+        const ts = new Date(snapshot.timestamp);
+        const label = isNaN(ts.getTime())
+          ? new Date().toLocaleTimeString()
+          : ts.toLocaleTimeString([], { hour12: false });
+
+        timeLabels.push(label);
+        const trimmed = timeLabels.length > MAX_POINTS;
+        if (trimmed) {
+          timeLabels.shift();
+        }
+
+        const backends = snapshot.backends || [];
+        backends.forEach((b, idx) => {
+          const color = SERIES_PALETTE[idx % SERIES_PALETTE.length];
+          if (!rpsSeriesByURL.has(b.url)) {
+            const pad = Array(Math.max(0, timeLabels.length - 1)).fill(0);
+            const rpsDataset = {
+              label: shortBackendLabel(b.url),
+              data: pad,
+              borderColor: color,
+              backgroundColor: color,
+              borderWidth: 2,
+              pointRadius: 0,
+              pointHoverRadius: 4,
+              tension: 0.25
+            };
+            rpsSeriesByURL.set(b.url, rpsDataset);
+            rpsChart.data.datasets.push(rpsDataset);
+
+            const latDataset = {
+              label: shortBackendLabel(b.url),
+              data: pad.slice(),
+              borderColor: color,
+              backgroundColor: color,
+              borderWidth: 2,
+              pointRadius: 0,
+              pointHoverRadius: 4,
+              tension: 0.25
+            };
+            latencySeriesByURL.set(b.url, latDataset);
+            latencyChart.data.datasets.push(latDataset);
+          }
+
+          const rpsDs = rpsSeriesByURL.get(b.url);
+          rpsDs.data.push(Number((b.requests_per_sec || 0).toFixed(2)));
+          if (trimmed && rpsDs.data.length > MAX_POINTS) rpsDs.data.shift();
+
+          const latDs = latencySeriesByURL.get(b.url);
+          const latVal = b.recent_latency_ms > 0 ? b.recent_latency_ms : b.avg_latency_ms;
+          latDs.data.push(Number((latVal || 0).toFixed(2)));
+          if (trimmed && latDs.data.length > MAX_POINTS) latDs.data.shift();
+        });
+
+        rpsChart.update('none');
+        latencyChart.update('none');
+      }
+
+      function renderSnapshot(snapshot) {
+        const totals = snapshot.totals || {};
+        els.strategy.textContent = snapshot.strategy || 'round_robin';
+        els.uptime.textContent = formatDurationSec(snapshot.uptime_sec || 0);
+
+        const ts = new Date(snapshot.timestamp);
+        els.updated.textContent = isNaN(ts.getTime()) ? '—' : ts.toLocaleTimeString([], { hour12: false });
+
+        els.kpiHealthy.textContent = `${totals.healthy_backends ?? 0} / ${totals.total_backends ?? 0}`;
+        els.kpiActive.textContent = (totals.active_connections ?? 0).toLocaleString();
+        els.kpiRPS.textContent = (totals.requests_per_sec ?? 0).toFixed(1);
+        els.kpiTotalReq.textContent = (totals.total_requests ?? 0).toLocaleString();
+
+        const totalReq = totals.total_requests || 0;
+        const totalErr = totals.total_errors || 0;
+        const errPct = totalReq > 0 ? ((totalErr / totalReq) * 100).toFixed(2) : '0.00';
+        els.kpiErrSummary.textContent = `${totalErr.toLocaleString()} errors (${errPct}%)`;
+
+        els.kpiAvgLatency.textContent = `${(totals.avg_latency_ms ?? 0).toFixed(2)} ms`;
+        els.kpiRecentLatency.textContent = `1s window: ${(totals.recent_latency_ms ?? 0).toFixed(2)} ms`;
+
+        const backends = snapshot.backends || [];
+        const maxRPS = Math.max(1, ...backends.map((b) => b.requests_per_sec || 0));
+
+        els.tbody.innerHTML = backends.map((b) => {
+          const stateClass = b.alive ? 'healthy' : 'unhealthy';
+          const stateLabel = b.alive ? 'Healthy' : 'Unhealthy';
+          const rps = b.requests_per_sec || 0;
+          const barPct = Math.min(100, Math.round((rps / maxRPS) * 100));
+          const errClass = b.total_errors > 0 ? 'error-nonzero' : '';
+
+          return `
+            <tr>
+              <td>
+                <span class="status-pill ${stateClass}">
+                  <span class="status-dot"></span>
+                  ${stateLabel}
+                </span>
+              </td>
+              <td class="mono">${escapeHTML(b.url)}</td>
+              <td class="num">${b.weight}</td>
+              <td class="num">${b.active_connections.toLocaleString()}</td>
+              <td class="rps-cell">
+                <div class="mono">${rps.toFixed(1)} /s</div>
+                <div class="rps-bar-track"><div class="rps-bar-fill" style="width:${barPct}%"></div></div>
+              </td>
+              <td class="num">${b.total_requests.toLocaleString()}</td>
+              <td class="num ${errClass}">${b.total_errors.toLocaleString()}</td>
+              <td class="num">${(b.avg_latency_ms || 0).toFixed(2)} ms</td>
+              <td class="num">${(b.recent_latency_ms || 0).toFixed(2)} ms</td>
+            </tr>
+          `;
+        }).join('');
+
+        updateCharts(snapshot);
+      }
+
+      function connectSSE() {
+        const es = new EventSource('/events');
+
+        es.onopen = function () {
+          els.sseBadge.classList.remove('reconnecting');
+          els.sseText.textContent = 'Live (1s SSE)';
+        };
+
+        es.onmessage = function (ev) {
+          try {
+            const payload = JSON.parse(ev.data);
+            renderSnapshot(payload);
+          } catch (err) {
+            console.error('Failed parsing SSE snapshot:', err);
+          }
+        };
+
+        es.onerror = function () {
+          els.sseBadge.classList.add('reconnecting');
+          els.sseText.textContent = 'Reconnecting...';
+        };
+      }
+
+      initCharts();
+      connectSSE();
+    })();
+  </script>
+</body>
+</html>

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -17,13 +18,27 @@ const (
 	DefaultRiseThreshold = 2
 )
 
+// Stats merepresentasikan snapshot atomic metrik satu backend pada satu titik waktu.
+type Stats struct {
+	URL               string
+	Weight            int
+	Alive             bool
+	ActiveConnections int64
+	TotalRequests     uint64
+	TotalErrors       uint64
+	TotalLatencyNs    uint64
+}
+
 // Backend merepresentasikan satu server upstream HTTP beserta reverse proxy dan status kesehatannya.
 type Backend struct {
-	url          *url.URL
-	weight       int
-	alive        atomic.Bool
-	activeConns  atomic.Int64
-	reverseProxy *httputil.ReverseProxy
+	url            *url.URL
+	weight         int
+	alive          atomic.Bool
+	activeConns    atomic.Int64
+	totalRequests  atomic.Uint64
+	totalErrors    atomic.Uint64
+	totalLatencyNs atomic.Uint64
+	reverseProxy   *httputil.ReverseProxy
 
 	stateMu              sync.Mutex
 	consecutiveFailures  int
@@ -189,6 +204,30 @@ func (b *Backend) DecConnections() int64 {
 		if b.activeConns.CompareAndSwap(cur, cur-1) {
 			return cur - 1
 		}
+	}
+}
+
+// RecordRequest mencatat selesainya satu percobaan request ke backend secara atomic.
+func (b *Backend) RecordRequest(duration time.Duration, isError bool) {
+	b.totalRequests.Add(1)
+	if duration > 0 {
+		b.totalLatencyNs.Add(uint64(duration.Nanoseconds()))
+	}
+	if isError {
+		b.totalErrors.Add(1)
+	}
+}
+
+// Stats mengembalikan snapshot metrik backend saat ini secara lock-free.
+func (b *Backend) Stats() Stats {
+	return Stats{
+		URL:               b.url.String(),
+		Weight:            b.weight,
+		Alive:             b.alive.Load(),
+		ActiveConnections: b.activeConns.Load(),
+		TotalRequests:     b.totalRequests.Load(),
+		TotalErrors:       b.totalErrors.Load(),
+		TotalLatencyNs:    b.totalLatencyNs.Load(),
 	}
 }
 

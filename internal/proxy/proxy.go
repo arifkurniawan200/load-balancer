@@ -25,14 +25,14 @@ const (
 type retryContextKey struct{}
 
 type requestAttemptState struct {
-	origReq            *http.Request
-	origCtx            context.Context
-	recorder           *statusRecorder
-	bodyBytes          []byte
-	canRetryBody       bool
-	retries            int
-	finalBackend       string
-	releaseCurrentConn func()
+	origReq              *http.Request
+	origCtx              context.Context
+	recorder             *statusRecorder
+	bodyBytes            []byte
+	canRetryBody         bool
+	retries              int
+	finalBackend         string
+	finishCurrentAttempt func(recordMetrics bool, transportErr bool)
 }
 
 // LoadBalancer menerima trafik HTTP masuk dan meneruskannya ke backend sehat sesuai Strategy.
@@ -147,15 +147,21 @@ func (lb *LoadBalancer) dispatchAttempt(state *requestAttemptState) {
 	}
 
 	state.finalBackend = target.URLString()
+	attemptStart := time.Now()
 	target.IncConnections()
-	var decOnce sync.Once
-	release := func() {
-		decOnce.Do(func() {
+
+	var finishOnce sync.Once
+	finish := func(recordMetrics bool, transportErr bool) {
+		finishOnce.Do(func() {
 			target.DecConnections()
+			if recordMetrics {
+				isErr := transportErr || state.recorder.status >= http.StatusInternalServerError
+				target.RecordRequest(time.Since(attemptStart), isErr)
+			}
 		})
 	}
-	state.releaseCurrentConn = release
-	defer release()
+	state.finishCurrentAttempt = finish
+	defer finish(true, false)
 
 	if rp, ok := lb.proxies[target]; ok {
 		rp.ServeHTTP(state.recorder, attemptReq)
@@ -167,17 +173,21 @@ func (lb *LoadBalancer) dispatchAttempt(state *requestAttemptState) {
 func (lb *LoadBalancer) makeErrorHandler(b *backend.Backend) func(http.ResponseWriter, *http.Request, error) {
 	return func(rw http.ResponseWriter, req *http.Request, err error) {
 		state, _ := req.Context().Value(retryContextKey{}).(*requestAttemptState)
-		if state != nil && state.releaseCurrentConn != nil {
-			state.releaseCurrentConn()
-		}
 
-		// Jika client sendiri membatalkan request, jangan tandai backend bermasalah.
+		// Jika client sendiri membatalkan request, jangan tandai backend bermasalah maupun error upstream.
 		if state != nil && state.origCtx.Err() != nil {
+			if state.finishCurrentAttempt != nil {
+				state.finishCurrentAttempt(false, false)
+			}
 			lb.logger.Debug("client canceled proxied request",
 				slog.String("backend", b.URLString()),
 				slog.String("error", err.Error()),
 			)
 			return
+		}
+
+		if state != nil && state.finishCurrentAttempt != nil {
+			state.finishCurrentAttempt(true, true)
 		}
 
 		if b.MarkUnhealthy() {
