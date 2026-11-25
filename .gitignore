@@ -1,0 +1,8 @@
+# Compiled binaries
+/lb
+/backend
+/bin/
+*.exe
+*.test
+*.out
+coverage.txt
